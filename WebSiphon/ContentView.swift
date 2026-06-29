@@ -9,18 +9,23 @@ import SwiftUI
 import SwiftData
 import AppKit
 
+@MainActor
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \DownloadTarget.createdAt) private var downloadTargets: [DownloadTarget]
+    @Query(sort: \Item.createdAt, order: .reverse) private var sessions: [Item]
+    @Query(sort: \DownloadTarget.discoveryOrder) private var allTargets: [DownloadTarget]
 
     @State private var targetURL = ""
     @State private var logLines: [String] = ["[system] WebSiphon listo."]
-    @State private var runningTasks: [String: Task<Void, Never>] = [:]
-    @State private var runtimeStatusByURL: [String: String] = [:]
+    @State private var currentTask: Task<Void, Never>?
     @State private var isShowingSettings = false
+    @State private var activeSessionID: UUID?
 
     @AppStorage("downloadBasePath") private var downloadBasePath = defaultDesktopPath
     @AppStorage("downloadBaseBookmark") private var downloadBaseBookmark = Data()
+
+    private let engine = SiphonEngine()
+    private let maxDepth = 5
 
     private static var defaultDesktopPath: String {
         FileManager.default.homeDirectoryForCurrentUser
@@ -28,133 +33,189 @@ struct ContentView: View {
             .path
     }
 
+    private var currentSession: Item? {
+        if let activeSessionID,
+           let match = sessions.first(where: { $0.sessionID == activeSessionID }) {
+            return match
+        }
+        return sessions.first
+    }
+
+    private var sessionTargets: [DownloadTarget] {
+        guard let sessionID = currentSession?.sessionID else { return [] }
+        return allTargets
+            .filter { $0.sessionID == sessionID }
+            .sorted { lhs, rhs in
+                if lhs.discoveryOrder == rhs.discoveryOrder {
+                    return lhs.createdAt < rhs.createdAt
+                }
+                return lhs.discoveryOrder < rhs.discoveryOrder
+            }
+    }
+
+    private var isRunning: Bool {
+        currentTask != nil || currentSession?.status == "Running"
+    }
+
+    private var discoveredCount: Int { sessionTargets.count }
+    private var downloadedCount: Int { sessionTargets.filter { $0.state == "Downloaded" }.count }
+    private var failedCount: Int { sessionTargets.filter { $0.state == "Failed" }.count }
+    private var pendingCount: Int {
+        sessionTargets.filter { ["Discovered", "Queued", "Analyzing", "Downloading"].contains($0.state) }.count
+    }
+    private var deepestLevel: Int { sessionTargets.map(\.depth).max() ?? 0 }
+
     var body: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 10) {
-                        TextField("https://example.com", text: $targetURL)
-                            .textFieldStyle(.roundedBorder)
-
-                        Button("Siphon", action: startSiphon)
-                            .buttonStyle(.borderedProminent)
-                            .keyboardShortcut(.defaultAction)
-                    }
-
-                    Text("Sitios en cola: \(downloadTargets.count)")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    List(downloadTargets) { target in
-                        HStack {
-                            Text(target.url)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Text(status(for: target))
-                                .foregroundStyle(.secondary)
-
-                            Button {
-                                startDownload(for: target)
-                            } label: {
-                                Image(systemName: "play.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Iniciar descarga")
-                            .disabled(isRunning(target))
-
-                            Button {
-                                stopDownload(for: target)
-                            } label: {
-                                Image(systemName: "stop.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Detener descarga")
-                            .disabled(!isRunning(target))
-
-                            Button {
-                                removeTarget(target)
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Eliminar sitio de la cola")
-                        }
-                    }
-                }
+            headerPanel
                 .padding()
+
+            Divider()
+
+            listPanel
                 .frame(maxHeight: .infinity)
 
-                Divider()
+            Divider()
 
-                logArea
-                    .frame(maxHeight: .infinity)
-            }
+            logArea
+                .frame(minHeight: 170, maxHeight: 220)
         }
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                Button("Procesar todos") {
-                    processAllDownloads()
-                }
-                .disabled(downloadTargets.isEmpty)
-
-                Button("Clear", role: .destructive) {
-                    cancelAllDownloads()
-                    for target in downloadTargets {
-                        modelContext.delete(target)
-                    }
-                    logLines.removeAll()
-                    appendLog("Cola y log limpiados.")
-                }
-
-                Spacer()
-
-                Button("Settings") {
-                    isShowingSettings = true
-                }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 10)
-            .background(.bar)
+            bottomBar
         }
         .sheet(isPresented: $isShowingSettings) {
             settingsView
         }
-        .frame(minWidth: 900, minHeight: 540)
+        .frame(minWidth: 1040, minHeight: 680)
+        .onAppear {
+            activeSessionID = currentSession?.sessionID
+        }
+    }
+
+    private var headerPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                TextField("https://example.com", text: $targetURL)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(isRunning)
+
+                Button("Siphon", action: startSiphon)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isRunning)
+
+                Button("Stop", role: .destructive, action: stopCurrentSession)
+                    .disabled(!isRunning)
+            }
+
+            if let session = currentSession {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(session.rootURL)
+                            .font(.headline)
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Text(session.status)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(statusColor(for: session.status))
+                    }
+
+                    HStack(spacing: 10) {
+                        statCard(title: "Descubiertas", value: "\(discoveredCount)", color: .blue)
+                        statCard(title: "Descargadas", value: "\(downloadedCount)", color: .green)
+                        statCard(title: "Pendientes", value: "\(pendingCount)", color: .orange)
+                        statCard(title: "Errores", value: "\(failedCount)", color: .red)
+                        statCard(title: "Nivel", value: "\(deepestLevel)", color: .purple)
+                    }
+
+                    HStack(spacing: 12) {
+                        Label(session.destinationFolderPath, systemImage: "folder")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        if session.rootLocalRelativePath != nil {
+                            Button("Abrir offline") {
+                                openOfflineRoot(for: session)
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("Ingresa un sitio raíz y WebSiphon descubrirá y descargará sus URLs una por una.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var listPanel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("Estado").frame(width: 100, alignment: .leading)
+                Text("Nivel").frame(width: 50, alignment: .leading)
+                Text("Tipo").frame(width: 70, alignment: .leading)
+                Text("URL / Ruta").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Peso").frame(width: 90, alignment: .trailing)
+                Text("HTTP").frame(width: 60, alignment: .trailing)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.quaternary.opacity(0.35))
+
+            List(sessionTargets) { target in
+                URLRowView(target: target)
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            Button("Clear", role: .destructive) {
+                clearAllState()
+            }
+            .disabled(currentSession == nil && logLines.count <= 1)
+
+            Spacer()
+
+            Button("Settings") {
+                isShowingSettings = true
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.bar)
+    }
+
+    private func statCard(title: String, value: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(color.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private func startSiphon() {
-        let normalizedURL = targetURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedURL.isEmpty else {
-            appendLog("Entrada vacia: ingresa una URL valida.")
+        guard !isRunning else {
+            appendLog("Ya hay un sitio procesandose. Detenlo antes de iniciar otro.")
             return
         }
 
-        guard let candidate = URL(string: normalizedURL),
-              let scheme = candidate.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              candidate.host != nil else {
-            appendLog("URL invalida: \(normalizedURL)")
-            return
-        }
-
-        if downloadTargets.contains(where: { $0.url == normalizedURL }) {
-            appendLog("Ya estaba en cola: \(normalizedURL)")
-            targetURL = ""
-            return
-        }
-
-        modelContext.insert(DownloadTarget(url: normalizedURL))
-        runtimeStatusByURL[normalizedURL] = "Queued"
-        appendLog("Agregado a cola: \(normalizedURL)")
-        targetURL = ""
-    }
-
-    private func startDownload(for target: DownloadTarget) {
-        guard !isRunning(target) else { return }
-        guard let url = URL(string: target.url) else {
-            runtimeStatusByURL[target.url] = "Error"
-            appendLog("No se pudo iniciar (URL invalida): \(target.url)")
+        guard let rootURL = engine.normalizeSeedURL(targetURL) else {
+            appendLog("Entrada invalida: ingresa una URL http(s) valida.")
             return
         }
 
@@ -162,96 +223,249 @@ struct ContentView: View {
         if !ensureWritableBaseFolder(baseFolderURL) {
             appendLog("Sin permiso de escritura en: \(baseFolderURL.path)")
             guard requestFolderAuthorization(startingAt: baseFolderURL) else {
-                runtimeStatusByURL[target.url] = "Error"
                 appendLog("Descarga cancelada: no se concedio acceso a carpeta de destino.")
                 return
             }
             baseFolderURL = resolvedBaseFolderURL()
             guard ensureWritableBaseFolder(baseFolderURL) else {
-                runtimeStatusByURL[target.url] = "Error"
                 appendLog("La carpeta seleccionada sigue sin permisos de escritura.")
                 return
             }
         }
 
-        runtimeStatusByURL[target.url] = "Downloading"
-        appendLog("Iniciando descarga: \(target.url)")
+        clearAllState(preserveLogs: false)
 
-        let task = Task {
-            do {
-                let (data, _) = try await URLSession.shared.data(from: url)
-                try Task.checkCancellation()
+        let newSession = Item(
+            rootURL: rootURL.absoluteString,
+            normalizedRootURL: rootURL.absoluteString,
+            host: rootURL.host ?? "",
+            status: "Running",
+            destinationFolderPath: baseFolderURL.path
+        )
+        modelContext.insert(newSession)
+        activeSessionID = newSession.sessionID
+        targetURL = ""
+        appendLog("Analizando y descargando sitio raiz: \(rootURL.absoluteString)")
 
-                let gainedScope = baseFolderURL.startAccessingSecurityScopedResource()
-                defer {
-                    if gainedScope {
-                        baseFolderURL.stopAccessingSecurityScopedResource()
-                    }
+        let siteFolderName = engine.siteFolderName(for: rootURL)
+        let scopeStarted = baseFolderURL.startAccessingSecurityScopedResource()
+        let context = CrawlRunContext(rootURL: rootURL, baseFolderURL: baseFolderURL, siteFolderName: siteFolderName, maxDepth: maxDepth)
+
+        currentTask = Task {
+            defer {
+                if scopeStarted {
+                    baseFolderURL.stopAccessingSecurityScopedResource()
                 }
+                currentTask = nil
+            }
 
-                let savedFileURL = try saveHTML(data: data, siteURL: url, baseFolderURL: baseFolderURL)
+            do {
+                try await crawl(url: rootURL, parentURL: nil, depth: 0, session: newSession, context: context)
 
-                await MainActor.run {
-                    runtimeStatusByURL[target.url] = "Complete"
-                    runningTasks[target.url] = nil
-                    appendLog("Descarga completa: \(target.url) -> \(savedFileURL.path)")
+                if Task.isCancelled {
+                    finalizeSession(newSession, status: "Cancelled", rootLocalRelativePath: context.localPaths[rootURL.absoluteString])
+                    appendLog("Sesion detenida.")
+                } else {
+                    finalizeSession(newSession, status: "Completed", rootLocalRelativePath: context.localPaths[rootURL.absoluteString])
+                    appendLog("Sitio descargado para navegacion offline.")
                 }
             } catch is CancellationError {
-                await MainActor.run {
-                    runtimeStatusByURL[target.url] = "Stopped"
-                    runningTasks[target.url] = nil
-                    appendLog("Descarga detenida: \(target.url)")
-                }
+                finalizeSession(newSession, status: "Cancelled", rootLocalRelativePath: context.localPaths[rootURL.absoluteString])
+                appendLog("Sesion detenida.")
             } catch {
-                await MainActor.run {
-                    runtimeStatusByURL[target.url] = "Error"
-                    runningTasks[target.url] = nil
-                    appendLog("Error descargando \(target.url): \(error.localizedDescription)")
-                }
+                finalizeSession(newSession, status: "Failed", rootLocalRelativePath: context.localPaths[rootURL.absoluteString])
+                appendLog("Error fatal en la sesion: \(error.localizedDescription)")
             }
         }
-
-        runningTasks[target.url] = task
     }
 
-    private func stopDownload(for target: DownloadTarget) {
-        runningTasks[target.url]?.cancel()
-    }
+    private func crawl(url: URL, parentURL: String?, depth: Int, session: Item, context: CrawlRunContext) async throws {
+        try Task.checkCancellation()
+        guard let normalizedURL = engine.normalizedURL(for: url) else { return }
+        guard engine.shouldCrawl(normalizedURL, fromRoot: context.rootURL, depth: depth, maxDepth: context.maxDepth) else { return }
 
-    private func removeTarget(_ target: DownloadTarget) {
-        stopDownload(for: target)
-        runningTasks[target.url] = nil
-        runtimeStatusByURL[target.url] = nil
-        modelContext.delete(target)
-        appendLog("Sitio eliminado de la cola: \(target.url)")
-    }
-
-    private func processAllDownloads() {
-        guard !downloadTargets.isEmpty else {
-            appendLog("No hay sitios en cola para procesar.")
+        let normalizedString = normalizedURL.absoluteString
+        if context.visitedURLs.contains(normalizedString) {
             return
         }
 
-        appendLog("Procesando todos los sitios en cola (\(downloadTargets.count)).")
-        for target in downloadTargets where !isRunning(target) {
-            startDownload(for: target)
+        let target = upsertTarget(
+            sessionID: session.sessionID,
+            normalizedURL: normalizedString,
+            parentURL: parentURL,
+            depth: depth,
+            discoveryOrder: context.nextDiscoveryOrderIfNeeded(for: normalizedString)
+        )
+        context.knownURLs.insert(normalizedString)
+        context.visitedURLs.insert(normalizedString)
+
+        target.state = "Downloading"
+        target.errorMessage = nil
+        target.updatedAt = Date()
+        appendLog("[L\(depth)] Descargando: \(normalizedString)")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: normalizedURL)
+            try Task.checkCancellation()
+
+            let httpResponse = response as? HTTPURLResponse
+            let mimeType = httpResponse?.mimeType
+            let localPath = engine.localRelativePath(for: normalizedURL, mimeType: mimeType, siteFolderName: context.siteFolderName)
+            let isHTML = isHTMLResource(url: normalizedURL, mimeType: mimeType)
+
+            context.localPaths[normalizedString] = localPath
+            target.mimeType = mimeType
+            target.httpStatusCode = httpResponse?.statusCode
+            target.byteCount = Int64(data.count)
+            target.kind = engine.kind(for: normalizedURL, mimeType: mimeType)
+            target.localRelativePath = localPath
+            target.updatedAt = Date()
+
+            if isHTML, let html = engine.decodeHTML(from: data) {
+                target.state = "Analyzing"
+                let references = engine.extractReferences(from: html, baseURL: normalizedURL, rootURL: context.rootURL)
+                let crawlableReferences = references.filter {
+                    engine.shouldCrawl($0, fromRoot: context.rootURL, depth: depth + 1, maxDepth: context.maxDepth)
+                }
+
+                for childURL in crawlableReferences {
+                    let childKey = childURL.absoluteString
+                    if !context.knownURLs.contains(childKey) {
+                        context.knownURLs.insert(childKey)
+                        _ = upsertTarget(
+                            sessionID: session.sessionID,
+                            normalizedURL: childKey,
+                            parentURL: normalizedString,
+                            depth: depth + 1,
+                            discoveryOrder: context.nextDiscoveryOrderIfNeeded(for: childKey)
+                        )
+                        appendLog("[L\(depth + 1)] Descubierta: \(childKey)")
+                    }
+                }
+
+                for childURL in crawlableReferences {
+                    try Task.checkCancellation()
+                    try await crawl(
+                        url: childURL,
+                        parentURL: normalizedString,
+                        depth: depth + 1,
+                        session: session,
+                        context: context
+                    )
+                }
+
+                let rewrittenHTML = engine.rewriteHTML(
+                    html,
+                    pageURL: normalizedURL,
+                    pageLocalRelativePath: localPath,
+                    localPathsByRemoteURL: context.localPaths,
+                    rootURL: context.rootURL
+                )
+                try saveFile(data: Data(rewrittenHTML.utf8), relativePath: localPath, baseFolderURL: context.baseFolderURL)
+            } else {
+                try saveFile(data: data, relativePath: localPath, baseFolderURL: context.baseFolderURL)
+            }
+
+            target.state = "Downloaded"
+            target.updatedAt = Date()
+            if depth == 0 {
+                session.rootLocalRelativePath = localPath
+            }
+            appendLog("Guardado: \(localPath) · \(engine.humanReadableSize(bytes: Int64(data.count)))")
+        } catch is CancellationError {
+            target.state = "Stopped"
+            target.updatedAt = Date()
+            throw CancellationError()
+        } catch {
+            target.state = "Failed"
+            target.errorMessage = error.localizedDescription
+            target.updatedAt = Date()
+            appendLog("Error en \(normalizedString): \(error.localizedDescription)")
         }
     }
 
-    private func cancelAllDownloads() {
-        for task in runningTasks.values {
-            task.cancel()
+    private func upsertTarget(
+        sessionID: UUID,
+        normalizedURL: String,
+        parentURL: String?,
+        depth: Int,
+        discoveryOrder: Int
+    ) -> DownloadTarget {
+        if let existing = sessionTargets.first(where: { $0.normalizedURL == normalizedURL }) {
+            if existing.parentURL == nil {
+                existing.parentURL = parentURL
+            }
+            if existing.depth > depth {
+                existing.depth = depth
+            }
+            existing.updatedAt = Date()
+            return existing
         }
-        runningTasks.removeAll()
-        runtimeStatusByURL.removeAll()
+
+        let target = DownloadTarget(
+            sessionID: sessionID,
+            url: normalizedURL,
+            normalizedURL: normalizedURL,
+            parentURL: parentURL,
+            depth: depth,
+            state: depth == 0 ? "Queued" : "Discovered",
+            kind: "Unknown",
+            discoveryOrder: discoveryOrder
+        )
+        modelContext.insert(target)
+        return target
     }
 
-    private func isRunning(_ target: DownloadTarget) -> Bool {
-        runningTasks[target.url] != nil
+    private func finalizeSession(_ session: Item, status: String, rootLocalRelativePath: String?) {
+        session.status = status
+        session.completedAt = Date()
+        if let rootLocalRelativePath {
+            session.rootLocalRelativePath = rootLocalRelativePath
+        }
     }
 
-    private func status(for target: DownloadTarget) -> String {
-        runtimeStatusByURL[target.url] ?? "Queued"
+    private func stopCurrentSession() {
+        guard isRunning else { return }
+        currentSession?.status = "Stopping"
+        currentTask?.cancel()
+        appendLog("Solicitando detencion...")
+    }
+
+    private func clearAllState(preserveLogs: Bool = false) {
+        currentTask?.cancel()
+        currentTask = nil
+
+        for target in allTargets {
+            modelContext.delete(target)
+        }
+        for session in sessions {
+            modelContext.delete(session)
+        }
+
+        activeSessionID = nil
+        if preserveLogs {
+            appendLog("Sesion anterior limpiada.")
+        } else {
+            logLines = ["[system] WebSiphon listo."]
+        }
+    }
+
+    private func isHTMLResource(url: URL, mimeType: String?) -> Bool {
+        let extensionValue = url.pathExtension.lowercased()
+        if ["html", "htm", "php", "asp", "aspx", "jsp"].contains(extensionValue) {
+            return true
+        }
+        if extensionValue.isEmpty {
+            return mimeType?.lowercased().contains("html") ?? true
+        }
+        return mimeType?.lowercased().contains("html") ?? false
+    }
+
+    private func openOfflineRoot(for session: Item) {
+        guard let rootLocalRelativePath = session.rootLocalRelativePath else { return }
+        let baseFolderURL = URL(fileURLWithPath: session.destinationFolderPath, isDirectory: true)
+        let localURL = baseFolderURL.appendingPathComponent(rootLocalRelativePath)
+        NSWorkspace.shared.open(localURL)
     }
 
     private var settingsView: some View {
@@ -298,7 +512,7 @@ struct ContentView: View {
     private func pickDownloadFolder() {
         let panel = NSOpenPanel()
         panel.title = "Selecciona carpeta de descargas"
-        panel.message = "Elige la carpeta donde se guardaran los sitios."
+        panel.message = "Elige la carpeta donde se guardaran los sitios espejados."
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
@@ -345,7 +559,6 @@ struct ContentView: View {
         downloadBasePath = desktopURL.path
 
         if ensureWritableBaseFolder(desktopURL) {
-            // If Desktop is writable directly (e.g. non-sandbox preview), no bookmark is required.
             downloadBaseBookmark = Data()
             appendLog("Ruta de descarga restaurada a Escritorio.")
             return
@@ -396,26 +609,10 @@ struct ContentView: View {
         return URL(fileURLWithPath: downloadBasePath, isDirectory: true)
     }
 
-    private func saveHTML(data: Data, siteURL: URL, baseFolderURL: URL) throws -> URL {
-        let folderName = siteFolderName(for: siteURL)
-        let siteFolderURL = baseFolderURL.appendingPathComponent(folderName, isDirectory: true)
-
-        try FileManager.default.createDirectory(at: siteFolderURL, withIntermediateDirectories: true)
-
-        let htmlFileURL = siteFolderURL.appendingPathComponent("index.html", isDirectory: false)
-        try data.write(to: htmlFileURL, options: .atomic)
-        return htmlFileURL
-    }
-
-    private func siteFolderName(for url: URL) -> String {
-        let host = (url.host ?? "site").lowercased()
-        let hostWithoutWWW = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-        let firstComponent = hostWithoutWWW.split(separator: ".").first.map(String.init) ?? hostWithoutWWW
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-        let sanitized = firstComponent.unicodeScalars.map { scalar in
-            allowed.contains(scalar) ? String(scalar) : "-"
-        }.joined()
-        return sanitized.isEmpty ? "site" : sanitized
+    private func saveFile(data: Data, relativePath: String, baseFolderURL: URL) throws {
+        let fileURL = baseFolderURL.appendingPathComponent(relativePath, isDirectory: false)
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: fileURL, options: .atomic)
     }
 
     private var logArea: some View {
@@ -450,9 +647,135 @@ struct ContentView: View {
         formatter.dateFormat = "HH:mm:ss"
         return formatter.string(from: Date())
     }
+
+    private func statusColor(for status: String) -> Color {
+        switch status {
+        case "Completed", "Downloaded":
+            return .green
+        case "Running", "Downloading", "Analyzing":
+            return .blue
+        case "Stopping", "Stopped", "Cancelled":
+            return .orange
+        case "Failed":
+            return .red
+        default:
+            return .secondary
+        }
+    }
+}
+
+private final class CrawlRunContext {
+    let rootURL: URL
+    let baseFolderURL: URL
+    let siteFolderName: String
+    let maxDepth: Int
+    var knownURLs: Set<String> = []
+    var visitedURLs: Set<String> = []
+    var localPaths: [String: String] = [:]
+    private var orderByURL: [String: Int] = [:]
+    private var nextOrder: Int = 0
+
+    init(rootURL: URL, baseFolderURL: URL, siteFolderName: String, maxDepth: Int) {
+        self.rootURL = rootURL
+        self.baseFolderURL = baseFolderURL
+        self.siteFolderName = siteFolderName
+        self.maxDepth = maxDepth
+    }
+
+    func nextDiscoveryOrderIfNeeded(for url: String) -> Int {
+        if let existing = orderByURL[url] {
+            return existing
+        }
+        let value = nextOrder
+        orderByURL[url] = value
+        nextOrder += 1
+        return value
+    }
+}
+
+private struct URLRowView: View {
+    let target: DownloadTarget
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(target.state)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(stateColor)
+                .frame(width: 100, alignment: .leading)
+
+            Text("\(target.depth)")
+                .font(.caption.monospacedDigit())
+                .frame(width: 50, alignment: .leading)
+
+            Text(target.kind)
+                .font(.caption)
+                .frame(width: 70, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(target.url)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                HStack(spacing: 8) {
+                    if let localRelativePath = target.localRelativePath {
+                        Text(localRelativePath)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    if let errorMessage = target.errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(byteCountString)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 90, alignment: .trailing)
+
+            Text(httpCodeString)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .trailing)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var byteCountString: String {
+        guard target.byteCount > 0 else { return "—" }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: target.byteCount)
+    }
+
+    private var httpCodeString: String {
+        guard let httpStatusCode = target.httpStatusCode else { return "—" }
+        return String(httpStatusCode)
+    }
+
+    private var stateColor: Color {
+        switch target.state {
+        case "Downloaded":
+            return .green
+        case "Downloading", "Analyzing":
+            return .blue
+        case "Failed":
+            return .red
+        case "Stopped":
+            return .orange
+        default:
+            return .secondary
+        }
+    }
 }
 
 #Preview {
-    ContentView()
-        .modelContainer(for: [DownloadTarget.self], inMemory: true)
+    ContentView().modelContainer(for: [Item.self, DownloadTarget.self], inMemory: true)
 }
